@@ -2,12 +2,11 @@
 #
 #   irm https://raw.githubusercontent.com/jkryspin/h1z1-join/main/join.ps1 | iex
 #
-# Does everything: runtimes, downloads the 2016 game from Steam (you sign in once),
+# Does everything: runtimes, has your own Steam app download the 2016 game (no login asked here),
 # applies the H1Emu patch, and launches the game pointed at the server.
-# Re-running is safe and quick: it remembers your id, game folder and Steam login.
+# Re-running is safe and quick: it remembers your id and game folder.
 #
-# Optional env vars: H1Z1_NAME, H1Z1_GAME_DIR, H1Z1_STEAM_USER, H1Z1_NO_LAUNCH=1,
-#                    H1Z1_SKIP_PREREQS=1, H1Z1_SKIP_DOWNLOAD=1
+# Optional env vars: H1Z1_NAME, H1Z1_GAME_DIR, H1Z1_NO_LAUNCH=1, H1Z1_SKIP_PREREQS=1, H1Z1_SKIP_DOWNLOAD=1
 
 # Everything runs in a child scope so `iex` doesn't leak settings into the caller's session.
 & {
@@ -39,7 +38,7 @@
         if (Test-Path $StateFile) {
             try { return Get-Content $StateFile -Raw | ConvertFrom-Json } catch {}
         }
-        return [pscustomobject]@{ name = $null; gameDir = $null; steamUser = $null }
+        return [pscustomobject]@{ name = $null; gameDir = $null }
     }
     function Save-State($s) {
         New-Item -ItemType Directory -Force $StateDir | Out-Null
@@ -106,6 +105,8 @@ namespace H1z1Join {
             if ($m.Success) { $dirs += $m.Groups[1].Value }
         }
         $dirs += $DefaultGameDir
+        $steam = Get-SteamPath
+        if ($steam) { $dirs += Join-Path $steam "steamapps\content\app_$SteamApp\depot_$SteamDepot" }
         $roots = @()
         foreach ($k in 'HKCU:\Software\Valve\Steam', 'HKLM:\SOFTWARE\WOW6432Node\Valve\Steam') {
             try { $p = Get-ItemProperty $k -ErrorAction Stop; foreach ($v in $p.SteamPath, $p.InstallPath) { if ($v) { $roots += ($v -replace '/', '\') } } } catch {}
@@ -152,46 +153,137 @@ namespace H1z1Join {
         }
     }
 
-    function Get-DepotDownloader {
-        $ddDir = Join-Path $StateDir 'DepotDownloader'
-        $exe = Join-Path $ddDir 'DepotDownloader.exe'
-        if (Test-Path $exe) { return $exe }
-        $rel = Invoke-RestMethod 'https://api.github.com/repos/SteamRE/DepotDownloader/releases/latest' -Headers @{ 'User-Agent' = 'h1z1-join' }
-        $asset = $rel.assets | Where-Object { $_.name -eq 'DepotDownloader-windows-x64.zip' } | Select-Object -First 1
-        $zip = Join-Path $StateDir $asset.name
-        New-Item -ItemType Directory -Force $ddDir | Out-Null
-        Say "    fetching DepotDownloader $($rel.tag_name) (open-source Steam downloader by SteamRE)..."
-        Get-File $asset.browser_download_url $zip
-        Expand-Archive -Path $zip -DestinationPath $ddDir -Force
-        Remove-Item $zip -Force
-        return $exe
+    function Get-SteamPath {
+        try { return (Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction Stop).SteamPath -replace '/', '\' } catch { return $null }
+    }
+    function Get-SteamWindow {
+        Get-Process steamwebhelper -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle -eq 'Steam' } | Select-Object -First 1
     }
 
-    function Download-Game([string]$dir, $state) {
+    if (-not ('H1z1Join.Win' -as [type])) {
+        Add-Type -TypeDefinition @'
+namespace H1z1Join {
+    using System; using System.Runtime.InteropServices;
+    public static class Win {
+        [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
+        [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+        [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c);
+        [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte sc, int f, UIntPtr e);
+        [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+        [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr h);
+        [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+        [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+        [DllImport("user32.dll")] public static extern void mouse_event(int f, int x, int y, int d, UIntPtr e);
+    }
+}
+'@
+    }
+
+    # Opens the Steam client's Console tab and types a command into it, as if the player had.
+    function Send-SteamConsole([string]$cmd) {
+        Start-Process 'steam://open/console'
+        Start-Sleep 3
+        $w = Get-SteamWindow
+        if (-not $w) { return }
+        [H1z1Join.Win]::ShowWindow($w.MainWindowHandle, 9) | Out-Null
+        # Tapping Alt lets this process move another app's window to the front.
+        [H1z1Join.Win]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero); [H1z1Join.Win]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
+        [H1z1Join.Win]::SetForegroundWindow($w.MainWindowHandle) | Out-Null
+        Start-Sleep 1
+        # The console's input box isn't always focused, so click it: it spans the window, 82px (at 100% scaling) above the bottom edge.
+        [H1z1Join.Win]::SetProcessDPIAware() | Out-Null
+        $r = New-Object H1z1Join.Win+RECT
+        [H1z1Join.Win]::GetWindowRect($w.MainWindowHandle, [ref]$r) | Out-Null
+        $scale = [H1z1Join.Win]::GetDpiForWindow($w.MainWindowHandle) / 96.0
+        if ($scale -le 0) { $scale = 1 }
+        [H1z1Join.Win]::SetCursorPos([int](($r.L + $r.R) / 2), [int]($r.B - 82 * $scale)) | Out-Null
+        [H1z1Join.Win]::mouse_event(0x02, 0, 0, 0, [UIntPtr]::Zero); [H1z1Join.Win]::mouse_event(0x04, 0, 0, 0, [UIntPtr]::Zero)
+        Start-Sleep -Milliseconds 400
+        $ws = New-Object -ComObject WScript.Shell
+        $ws.SendKeys('^a')
+        $ws.SendKeys($cmd)
+        $ws.SendKeys('{ENTER}')
+    }
+
+    # Returns whatever Steam appended to its console log since $pos (and advances $pos).
+    function Read-SteamLog([string]$log, [ref]$pos) {
+        if (-not (Test-Path $log)) { return '' }
+        $fs = [IO.File]::Open($log, 'Open', 'Read', 'ReadWrite')
+        try {
+            if ($fs.Length -lt $pos.Value) { $pos.Value = 0 }
+            [void]$fs.Seek($pos.Value, 'Begin')
+            $text = (New-Object IO.StreamReader($fs)).ReadToEnd()
+            $pos.Value = $fs.Length
+            return $text
+        } finally { $fs.Close() }
+    }
+
+    # Has the player's own (already signed-in) Steam client download the exact depot via its
+    # `download_depot` console command, then moves the files into $dir. No credentials involved.
+    function Download-Game([string]$dir, [string]$app = $SteamApp, [string]$depot = $SteamDepot, [string]$manifest = $SteamManifest) {
         $free = (Get-PSDrive -Name $dir.Substring(0, 1)).Free
         if ($free -lt 25GB) { Warn ("only {0:N0} GB free on {1} - the game needs about 20 GB." -f ($free / 1GB), $dir.Substring(0, 2)) }
-        $dd = Get-DepotDownloader
-        $user = if ($env:H1Z1_STEAM_USER) { $env:H1Z1_STEAM_USER } else { $state.steamUser }
-        if (-not $user) {
-            Say ''
-            Say '    The 2016 game files come straight from Steam, so sign in with the Steam account' White
-            Say '    that owns H1Z1 / H1Z1: Just Survive. Your password goes only to Steam.' White
-            $user = Read-Host '    Steam username (or press Enter to sign in by scanning a QR code with the Steam app)'
+        $steam = Get-SteamPath
+        if (-not $steam -or -not (Test-Path (Join-Path $steam 'steam.exe'))) {
+            throw 'Steam is not installed. Install Steam, sign in with the account that owns H1Z1: Just Survive, then run this again.'
         }
-        $ddArgs = @('-app', $SteamApp, '-depot', $SteamDepot, '-manifest', $SteamManifest, '-dir', $dir, '-max-downloads', '16')
-        if ($user) {
-            $state.steamUser = $user; Save-State $state
-            $ddArgs += @('-username', $user, '-remember-password')
-        } else {
-            $ddArgs += @('-qr')
+        if (-not (Get-SteamWindow)) {
+            Say '    starting Steam (sign in there if it asks)...'
+            Start-Process 'steam://open/console'
+            $t = 0; while (-not (Get-SteamWindow) -and $t -lt 300) { Start-Sleep 5; $t += 5 }
+            if (-not (Get-SteamWindow)) { throw 'Steam did not open. Start Steam, sign in, then run this again.' }
+            Start-Sleep 10
         }
-        Say '    Downloading (~20 GB). Enter your Steam password / Steam Guard code below when asked.' White
-        Say '    If it gets interrupted, just run the command again - it resumes.' White
-        Push-Location (Split-Path $dd)
-        try { & $dd @ddArgs } finally { Pop-Location }
-        if ($LASTEXITCODE -ne 0) { Warn "DepotDownloader exited with code $LASTEXITCODE." }
-        $cache = Join-Path $dir '.DepotDownloader'
-        if (Test-Path $cache) { Remove-Item $cache -Recurse -Force -ErrorAction SilentlyContinue }
+        $log = Join-Path $steam 'logs\console_log.txt'
+        $pos = if (Test-Path $log) { (Get-Item $log).Length } else { 0 }
+        $cmd = "download_depot $app $depot $manifest".Trim()
+        $depotRx = [regex]::Escape($depot)
+
+        Say ''
+        Say '    Your Steam app will download the game using the account it is signed into.' White
+        Say '    Steam will pop up on its Console tab and this script will type the download command for you.' White
+        Say '    Hands off the keyboard and mouse for about 10 seconds...' Yellow
+        Start-Sleep 3
+
+        $size = $null; $done = $null
+        for ($attempt = 1; $attempt -le 3 -and -not $size -and -not $done; $attempt++) {
+            Send-SteamConsole $cmd
+            for ($t = 0; $t -lt 40 -and -not $size -and -not $done; $t += 2) {
+                Start-Sleep 2
+                $new = Read-SteamLog $log ([ref]$pos)
+                $m = [regex]::Match($new, "Downloading depot $depotRx \(([^)]*)\)"); if ($m.Success) { $size = $m.Groups[1].Value }
+                $m = [regex]::Match($new, "Depot download complete : `"([^`"]*depot_$depotRx)`""); if ($m.Success) { $done = $m.Groups[1].Value }
+            }
+            if (-not $size -and -not $done -and $attempt -lt 3) { Warn 'Steam did not react yet, trying again...' }
+        }
+        if (-not $size -and -not $done) {
+            try { Set-Clipboard -Value $cmd } catch {}
+            throw ("Steam didn't start the download. Most likely the Steam account signed in right now doesn't own " +
+                   "H1Z1: Just Survive (app $app). If it does: open Steam's Console tab, paste (it's on your clipboard) and press Enter, then run this again.")
+        }
+        if ($size) { Ok "Steam is downloading the game ($size). Keep Steam open; you can use the PC meanwhile." }
+        $contentDir = Join-Path $steam "steamapps\content\app_$app\depot_$depot"
+        $totalMb = if ($size -match '([\d,.]+) MB') { [double]($Matches[1] -replace ',', '') } else { 0 }
+        $lastShown = Get-Date
+        while (-not $done) {
+            Start-Sleep 5
+            $new = Read-SteamLog $log ([ref]$pos)
+            $m = [regex]::Match($new, "Depot download complete : `"([^`"]*depot_$depotRx)`""); if ($m.Success) { $done = $m.Groups[1].Value; break }
+            if ($new -match "(?im)^.*depot.*(failed|error).*$") { throw "Steam reported: $($Matches[0].Trim())" }
+            if (((Get-Date) - $lastShown).TotalSeconds -ge 30 -and (Test-Path -LiteralPath $contentDir)) {
+                $lastShown = Get-Date
+                $mb = ((Get-ChildItem -LiteralPath $contentDir -Recurse -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum) / 1MB
+                if ($totalMb -gt 0) { Say ("    ... {0:N0} / {1:N0} MB ({2:N0}%)" -f $mb, $totalMb, [math]::Min(100, 100 * $mb / $totalMb)) }
+                else { Say ("    ... {0:N0} MB so far" -f $mb) }
+            }
+        }
+        Ok 'Steam finished downloading'
+        Say "    moving files to $dir..."
+        New-Item -ItemType Directory -Force $dir | Out-Null
+        robocopy $done $dir /E /MOVE /R:2 /W:2 /NFL /NDL /NJH /NJS /NP | Out-Null
+        if ($LASTEXITCODE -ge 8) { throw "Moving the files from '$done' failed (robocopy code $LASTEXITCODE)." }
+        $appDir = Split-Path $done
+        if ((Test-Path -LiteralPath $appDir) -and -not (Get-ChildItem -LiteralPath $appDir -Recurse -File)) { Remove-Item -LiteralPath $appDir -Recurse -Force }
     }
 
     # Mirrors what the H1Emu launcher does before every launch of the 2016 build.
@@ -288,7 +380,6 @@ namespace H1z1Join {
     Write-Host '  -----------------------------------------------' -ForegroundColor Magenta
 
     $state = Load-State
-    if (-not ($state.PSObject.Properties.Name -contains 'steamUser')) { $state | Add-Member steamUser $null }
 
     # 1. Name / account
     Step 'Your player id'
@@ -331,10 +422,9 @@ namespace H1z1Join {
         if ($target -match 'King of the Kill|steamapps') { throw "Pick a separate folder, not a Steam game folder ('$target')." }
         New-Item -ItemType Directory -Force $target | Out-Null
         $state.gameDir = $target; Save-State $state
-        Download-Game $target $state
+        Download-Game $target
         if (-not (Test-Game2016 $target)) {
-            throw ("The download didn't finish or isn't the 2016 build. If Steam said the account doesn't own app $SteamApp, " +
-                   'that Steam account cannot get these files. Otherwise just run the command again to resume.')
+            throw "The downloaded files aren't the 22 Dec 2016 build (H1Z1.exe checksum mismatch). Run the command again."
         }
         $gameDir = $target
         Ok "downloaded and verified: $gameDir"
